@@ -24,6 +24,7 @@ class CompanyVerificationUpdate(BaseModel):
 
 class CompanyVerification(CompanyVerificationBase):
     id: str
+    company_name: Optional[str] = None
     created_at: datetime = datetime.now()
     updated_at: datetime = datetime.now()
     verified_by: Optional[str] = None  # Admin ID who verified

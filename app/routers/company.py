@@ -1,23 +1,23 @@
 from fastapi import APIRouter, HTTPException, Depends, status
-from fastapi.security import OAuth2PasswordBearer
-from app.models.company import CompanyCreate, CompanyUpdate, Company
-from app.database.database import get_companies_collection
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, and_, update
+from app.models.company import CompanyCreate, CompanyUpdate, Company as CompanySchema
+from app.database.database import get_db
+from app.database.models import Company as CompanyModel
 from app.utils.auth import get_current_user
-from bson import ObjectId
 from typing import List
-import datetime
+from datetime import datetime
+import uuid
 
 router = APIRouter(prefix="/api/companies", tags=["Companies"])
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
-
-@router.post("/", response_model=Company)
+@router.post("/", response_model=CompanySchema)
 async def create_company(
     company: CompanyCreate,
-    token: str = Depends(oauth2_scheme)
+    token: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
-    current_user = await get_current_user(token)
-    
+    current_user = token
     # Only employers can create companies
     if current_user.get("role") != "employer":
         raise HTTPException(
@@ -25,58 +25,47 @@ async def create_company(
             detail="Only employers can create companies"
         )
     
-    # Get collection in the current request context
-    companies_collection = get_companies_collection()
-    
     # Check if company already exists
-    existing_company = await companies_collection.find_one({"name": company.name})
-    if existing_company:
+    stmt = select(CompanyModel).where(CompanyModel.name == company.name)
+    result = await db.execute(stmt)
+    if result.scalar_one_or_none():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Company with this name already exists"
         )
     
     # Create company
-    company_dict = company.dict()
-    company_dict["created_by"] = current_user["id"]
-    company_dict["verification_status"] = "pending"  # Default status
-    company_dict["is_verified"] = False  # Default value
-    company_dict["created_at"] = datetime.datetime.utcnow()
-    company_dict["updated_at"] = datetime.datetime.utcnow()
+    db_company = CompanyModel(
+        id=str(uuid.uuid4()),
+        **company.model_dump(),
+        created_by=current_user["id"],
+        verification_status="pending",  # Default status
+        is_verified=False,  # Default value
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow()
+    )
     
-    result = await companies_collection.insert_one(company_dict)
-    company_dict["id"] = str(result.inserted_id)
+    db.add(db_company)
+    await db.commit()
+    await db.refresh(db_company)
     
-    return Company(**company_dict)
+    return db_company
 
-@router.get("/", response_model=List[Company])
+@router.get("/", response_model=List[CompanySchema])
 async def get_companies(
     skip: int = 0,
-    limit: int = 20
+    limit: int = 20,
+    db: AsyncSession = Depends(get_db)
 ):
-    # Get collection in the current request context
-    companies_collection = get_companies_collection()
-    
-    companies = []
-    async for company in companies_collection.find().skip(skip).limit(limit):
-        company["id"] = str(company["_id"])
-        del company["_id"]
-        companies.append(Company(**company))
-    
-    return companies
+    stmt = select(CompanyModel).offset(skip).limit(limit)
+    result = await db.execute(stmt)
+    return result.scalars().all()
 
-@router.get("/{company_id}", response_model=Company)
-async def get_company(company_id: str):
-    # Get collection in the current request context
-    companies_collection = get_companies_collection()
-    
-    try:
-        company = await companies_collection.find_one({"_id": ObjectId(company_id)})
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid company ID"
-        )
+@router.get("/{company_id}", response_model=CompanySchema)
+async def get_company(company_id: str, db: AsyncSession = Depends(get_db)):
+    stmt = select(CompanyModel).where(CompanyModel.id == company_id)
+    result = await db.execute(stmt)
+    company = result.scalar_one_or_none()
     
     if not company:
         raise HTTPException(
@@ -84,67 +73,41 @@ async def get_company(company_id: str):
             detail="Company not found"
         )
     
-    company["id"] = str(company["_id"])
-    del company["_id"]
-    
-    return Company(**company)
+    return company
 
-@router.put("/{company_id}", response_model=Company)
+@router.put("/{company_id}", response_model=CompanySchema)
 async def update_company(
     company_id: str,
     company_update: CompanyUpdate,
-    token: str = Depends(oauth2_scheme)
+    token: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
-    current_user = await get_current_user(token)
+    current_user = token
     
-    # Get collection in the current request context
-    companies_collection = get_companies_collection()
+    stmt = select(CompanyModel).where(CompanyModel.id == company_id)
+    result = await db.execute(stmt)
+    db_company = result.scalar_one_or_none()
     
-    try:
-        # Find the company first
-        company = await companies_collection.find_one({"_id": ObjectId(company_id)})
-        if not company:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Company not found"
-            )
-        
-        # Check if user is authorized to update (owner or admin)
-        if company["created_by"] != current_user["id"] and current_user.get("role") != "admin":
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Not authorized to update this company"
-            )
-        
-        # Prepare update data
-        update_data = company_update.dict(exclude_unset=True)
-        update_data["updated_at"] = datetime.datetime.utcnow()
-        
-        # Update the company
-        result = await companies_collection.update_one(
-            {"_id": ObjectId(company_id)},
-            {"$set": update_data}
-        )
-        
-        if result.modified_count == 0:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No changes made to company"
-            )
-        
-        # Return updated company
-        updated_company = await companies_collection.find_one({"_id": ObjectId(company_id)})
-        if updated_company:
-            updated_company["id"] = str(updated_company["_id"])
-            del updated_company["_id"]
-            return Company(**updated_company)
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Company not found"
-            )
-    except Exception:
+    if not db_company:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid company ID"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Company not found"
         )
+        
+    # Check if user is authorized to update (owner or admin)
+    if db_company.created_by != current_user["id"] and current_user.get("role") != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to update this company"
+        )
+    
+    # Prepare update data
+    update_data = company_update.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(db_company, key, value)
+    
+    db_company.updated_at = datetime.utcnow()
+    
+    await db.commit()
+    await db.refresh(db_company)
+    return db_company

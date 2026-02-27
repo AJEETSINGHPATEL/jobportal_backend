@@ -1,207 +1,170 @@
 from fastapi import APIRouter, HTTPException, Depends, status
-from fastapi.security import OAuth2PasswordBearer
-from bson import ObjectId
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func, and_
 from typing import List
-import datetime
-from app.models.job import Job
-from app.models.application import Application
-from app.database.database import get_jobs_collection, get_applications_collection, get_users_collection
+from datetime import datetime
+from app.database.database import get_db
+from app.database.models import Job as JobModel, Application as ApplicationModel, User as UserModel
+from app.models.job import Job as JobSchema
+from app.models.application import Application as ApplicationSchema
 from app.utils.auth import get_current_user
 
 router = APIRouter(prefix="/api/employer", tags=["Employer"])
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
-
 @router.get("/dashboard/stats")
-async def get_employer_dashboard_stats(token: str = Depends(oauth2_scheme)):
+async def get_employer_dashboard_stats(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
     """Get dashboard statistics for the employer"""
-    current_user = await get_current_user(token)
-    
-    # Only employers can access this
     if current_user.get("role") != "employer":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only employers can access dashboard stats"
         )
     
-    jobs_collection = get_jobs_collection()
-    applications_collection = get_applications_collection()
+    # Total jobs posted by employer
+    jobs_stmt = select(func.count(JobModel.id)).where(JobModel.posted_by == current_user["id"])
+    total_jobs = (await db.execute(jobs_stmt)).scalar() or 0
     
-    # Get employer's jobs
-    employer_jobs = []
-    async for job in jobs_collection.find({"created_by": current_user["id"]}):
-        job["id"] = str(job["_id"])
-        del job["_id"]
-        employer_jobs.append(job)
+    # Active jobs
+    active_jobs_stmt = select(func.count(JobModel.id)).where(
+        and_(JobModel.posted_by == current_user["id"], JobModel.is_active == True)
+    )
+    active_jobs = (await db.execute(active_jobs_stmt)).scalar() or 0
     
-    total_jobs = len(employer_jobs)
-    active_jobs = len([job for job in employer_jobs if job.get("is_active", False)])
+    # Total applications for employer's jobs
+    apps_stmt = select(func.count(ApplicationModel.id)).join(JobModel, JobModel.id == ApplicationModel.job_id).where(
+        JobModel.posted_by == current_user["id"]
+    )
+    total_applications = (await db.execute(apps_stmt)).scalar() or 0
     
-    # Get applications for employer's jobs
-    employer_job_ids = [job["id"] for job in employer_jobs]
-    applications = []
-    async for application in applications_collection.find({"job_id": {"$in": employer_job_ids}}):
-        application["id"] = str(application["_id"])
-        del application["_id"]
-        applications.append(application)
-    
-    total_applications = len(applications)
-    shortlisted_applications = len([app for app in applications if app.get("status") == "shortlisted"])
+    # Shortlisted applications
+    shortlisted_stmt = select(func.count(ApplicationModel.id)).join(JobModel, JobModel.id == ApplicationModel.job_id).where(
+        and_(JobModel.posted_by == current_user["id"], ApplicationModel.status == "shortlisted")
+    )
+    shortlisted = (await db.execute(shortlisted_stmt)).scalar() or 0
     
     return {
         "totalJobs": total_jobs,
         "activeJobs": active_jobs,
         "totalApplications": total_applications,
-        "shortlisted": shortlisted_applications
+        "shortlisted": shortlisted
     }
 
 @router.get("/jobs")
-async def get_employer_jobs(token: str = Depends(oauth2_scheme)):
+async def get_employer_jobs(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
     """Get jobs created by the employer"""
-    current_user = await get_current_user(token)
-    
-    # Only employers can access this
     if current_user.get("role") != "employer":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only employers can access their jobs"
         )
     
-    jobs_collection = get_jobs_collection()
+    stmt = select(JobModel).where(JobModel.posted_by == current_user["id"]).order_by(JobModel.posted_date.desc())
+    result = await db.execute(stmt)
+    jobs_list = result.scalars().all()
     
-    jobs = []
-    async for job in jobs_collection.find({"created_by": current_user["id"]}).sort("posted_date", -1):
-        job["id"] = str(job["_id"])
-        del job["_id"]
+    # Map to schema and add application count
+    jobs_with_counts = []
+    for job in jobs_list:
+        app_count_stmt = select(func.count(ApplicationModel.id)).where(ApplicationModel.job_id == job.id)
+        app_count = (await db.execute(app_count_stmt)).scalar() or 0
         
-        # Count applications for this job
-        applications_collection = get_applications_collection()
-        application_count = await applications_collection.count_documents({"job_id": job["id"]})
-        job["application_count"] = application_count
-        
-        jobs.append(Job(**job))
+        # Merge model data into dict for return
+        job_dict = {column.name: getattr(job, column.name) for column in job.__table__.columns}
+        job_dict["application_count"] = app_count
+        jobs_with_counts.append(job_dict)
     
-    return jobs
+    return jobs_with_counts
 
 @router.get("/applications")
-async def get_employer_applications(token: str = Depends(oauth2_scheme)):
+async def get_employer_applications(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
     """Get applications for the employer's jobs"""
-    current_user = await get_current_user(token)
-    
-    # Only employers can access this
     if current_user.get("role") != "employer":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only employers can access their job applications"
         )
     
-    jobs_collection = get_jobs_collection()
-    applications_collection = get_applications_collection()
-    users_collection = get_users_collection()
+    stmt = select(ApplicationModel, JobModel.title, JobModel.company, UserModel.full_name, UserModel.email)\
+        .join(JobModel, JobModel.id == ApplicationModel.job_id)\
+        .join(UserModel, UserModel.id == ApplicationModel.user_id)\
+        .where(JobModel.posted_by == current_user["id"])\
+        .order_by(ApplicationModel.applied_at.desc())
     
-    # Get employer's jobs
-    employer_jobs = []
-    async for job in jobs_collection.find({"created_by": current_user["id"]}):
-        employer_jobs.append(str(job["_id"]))
-    
+    result = await db.execute(stmt)
     applications = []
-    async for application in applications_collection.find({"job_id": {"$in": employer_jobs}}):
-        application["id"] = str(application["_id"])
-        del application["_id"]
-        
-        # Get job details
-        if ObjectId.is_valid(application["job_id"]):
-            job = await jobs_collection.find_one({"_id": ObjectId(application["job_id"])})
-            if job:
-                application["job_title"] = job.get("title", "")
-                application["company"] = job.get("company", "")
-            else:
-                application["job_title"] = "Job Not Found"
-                application["company"] = "Unknown"
-        else:
-            application["job_title"] = "Invalid Job ID"
-            application["company"] = "Unknown"
-        
-        # Get user details
-        user = await users_collection.find_one({"_id": ObjectId(application["user_id"])})
-        if user:
-            application["applicant_name"] = user.get("full_name", user.get("email", "Unknown"))
-            application["applicant_email"] = user.get("email", "")
-        else:
-            application["applicant_name"] = "Unknown"
-            application["applicant_email"] = ""
-        
-        applications.append(Application(**application))
+    for app, job_title, company, applicant_name, applicant_email in result.all():
+        app_dict = {column.name: getattr(app, column.name) for column in app.__table__.columns}
+        app_dict["job_title"] = job_title
+        app_dict["company"] = company
+        app_dict["applicant_name"] = applicant_name
+        app_dict["applicant_email"] = applicant_email
+        applications.append(app_dict)
     
     return applications
 
 @router.get("/activity")
-async def get_employer_activity(token: str = Depends(oauth2_scheme)):
+async def get_employer_activity(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
     """Get recent activity for the employer"""
-    current_user = await get_current_user(token)
-    
-    # Only employers can access this
     if current_user.get("role") != "employer":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only employers can access their activity"
         )
     
-    jobs_collection = get_jobs_collection()
-    applications_collection = get_applications_collection()
-    users_collection = get_users_collection()
-    
-    # Get employer's jobs
-    employer_jobs = []
-    async for job in jobs_collection.find({"created_by": current_user["id"]}):
-        employer_jobs.append({
-            "id": str(job["_id"]),
-            "title": job.get("title", ""),
-            "created_at": job.get("posted_date", datetime.datetime.utcnow())
-        })
-    
     activity = []
     
-    # Add job posting activities
-    for job in employer_jobs:
+    # 1. Recent job postings
+    jobs_stmt = select(JobModel).where(JobModel.posted_by == current_user["id"]).order_by(JobModel.posted_date.desc()).limit(10)
+    jobs_res = await db.execute(jobs_stmt)
+    for job in jobs_res.scalars().all():
         activity.append({
             "type": "job_posted",
-            "title": job["title"],
-            "description": f"Job posted: {job['title']}",
-            "timestamp": job["created_at"],
+            "title": job.title,
+            "description": f"Job posted: {job.title}",
+            "timestamp": job.posted_date,
             "icon": "plus"
         })
     
-    # Add application activities
-    for job in employer_jobs:
-        async for app in applications_collection.find({"job_id": job["id"]}).sort("applied_date", -1).limit(5):
-            user = await users_collection.find_one({"_id": ObjectId(app["user_id"])})
-            applicant_name = user.get("full_name", user.get("email", "Applicant")) if user else "Applicant"
-            
-            activity.append({
-                "type": "application_received",
-                "title": applicant_name,
-                "description": f"{applicant_name} applied for {job['title']}",
-                "timestamp": app.get("applied_date", datetime.datetime.utcnow()),
-                "icon": "user"
-            })
+    # 2. Recent applications received & shortlist actions
+    apps_stmt = select(ApplicationModel, JobModel.title, UserModel.full_name)\
+        .join(JobModel, JobModel.id == ApplicationModel.job_id)\
+        .join(UserModel, UserModel.id == ApplicationModel.user_id)\
+        .where(JobModel.posted_by == current_user["id"])\
+        .order_by(ApplicationModel.applied_at.desc()).limit(10)
+    apps_res = await db.execute(apps_stmt)
     
-    # Add shortlist activities
-    for job in employer_jobs:
-        async for app in applications_collection.find({"job_id": job["id"], "status": "shortlisted"}).sort("updated_date", -1):
-            user = await users_collection.find_one({"_id": ObjectId(app["user_id"])})
-            applicant_name = user.get("full_name", user.get("email", "Applicant")) if user else "Applicant"
-            
+    for app, job_title, applicant_name in apps_res.all():
+        # Application received activity
+        activity.append({
+            "type": "application_received",
+            "title": applicant_name,
+            "description": f"{applicant_name} applied for {job_title}",
+            "timestamp": app.applied_at,
+            "icon": "user"
+        })
+        
+        # Shortlisted activity (using updated_at as proxy for action time)
+        if app.status == "shortlisted":
             activity.append({
                 "type": "shortlisted",
                 "title": applicant_name,
-                "description": f"{applicant_name} shortlisted for {job['title']}",
-                "timestamp": app.get("updated_date", datetime.datetime.utcnow()),
+                "description": f"{applicant_name} shortlisted for {job_title}",
+                "timestamp": app.updated_at or app.applied_at,
                 "icon": "star"
             })
     
-    # Sort by most recent
+    # Sort by timestamp and return top 5
     activity.sort(key=lambda x: x["timestamp"], reverse=True)
-    
-    # Limit to top 5 activities
     return activity[:5]

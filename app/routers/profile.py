@@ -1,16 +1,17 @@
 from fastapi import APIRouter, HTTPException, Depends, status, UploadFile, File
-from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, update
+from app.database.database import get_db
+from app.database.models import JobSeekerProfile as JobSeekerProfileModel, User as UserModel
 from app.models.profile import ProfileCreate, ProfileUpdate, ProfileInDB
-from app.database.database import get_profiles_collection, get_users_collection
 from app.utils.auth import get_current_user
-from bson import ObjectId
 from typing import List, Optional
 import datetime
+import uuid
 import os
 from pathlib import Path
 
 router = APIRouter(prefix="/api/profile", tags=["Profile"])
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 def calculate_profile_completion(profile_data: dict) -> int:
     """Calculate profile completion percentage based on required and optional fields"""
@@ -18,397 +19,265 @@ def calculate_profile_completion(profile_data: dict) -> int:
     earned_points = 0
     
     # Required fields (higher weight)
+    personal_details = profile_data.get('personal_details', {})
+    if not personal_details:
+        personal_details = profile_data # Fallback for schema dict
+        
     required_fields = ['fullName', 'email']
     for field in required_fields:
-        if profile_data.get(field) and str(profile_data.get(field)).strip():
-            earned_points += 2  # Weighted more heavily
+        if personal_details.get(field) and str(personal_details.get(field)).strip():
+            earned_points += 2
         total_points += 2
     
-    # Optional fields (standard weight)
-    optional_fields = ['phone', 'address', 'headline', 'summary', 'profilePicture']
-    for field in optional_fields:
-        if profile_data.get(field) and str(profile_data.get(field)).strip():
+    # Optional fields
+    phone = profile_data.get('phone')
+    if phone and str(phone).strip():
+        earned_points += 1
+    total_points += 1
+    
+    for field in ['address', 'headline', 'summary', 'profilePicture']:
+        if personal_details.get(field) and str(personal_details.get(field)).strip():
             earned_points += 1
         total_points += 1
     
-    # Experience section (can have multiple entries)
-    experience = profile_data.get('experience', [])
+    # Experience section
+    experience = profile_data.get('employment_history', profile_data.get('experience', []))
     if experience:
-        # Count each experience entry with at least title and company as 2 points
         for exp in experience:
             if exp.get('title') and exp.get('company'):
                 earned_points += 2
-            total_points += 2  # Max possible for experience section
+            total_points += 2
     
-    # Education section (can have multiple entries)
+    # Education section
     education = profile_data.get('education', [])
     if education:
-        # Count each education entry with at least school and degree as 2 points
         for edu in education:
             if edu.get('school') and edu.get('degree'):
                 earned_points += 2
-            total_points += 2  # Max possible for education section
+            total_points += 2
     
     # Skills section
     skills = profile_data.get('skills', [])
     if skills:
-        # Count each skill as 0.5 points, max 10 points for skills
         skill_points = min(len(skills) * 0.5, 10)
         earned_points += skill_points
-        total_points += 10  # Max possible for skills section
+        total_points += 10
 
     # Projects section
     projects = profile_data.get('projects', [])
     if projects:
-        # Count each project as 2 points
         for proj in projects:
             if proj.get('title') and proj.get('description'):
                 earned_points += 2
             total_points += 2
     else:
-        # Assume 2 projects for total points calculation if none exist yet
         total_points += 4
     
     if total_points == 0:
         return 0
     
     completion_percentage = int((earned_points / total_points) * 100)
-    return min(completion_percentage, 100)  # Cap at 100%
+    return min(completion_percentage, 100)
+
+def map_model_to_schema(db_profile: JobSeekerProfileModel, user: Optional[UserModel] = None) -> ProfileInDB:
+    pd = db_profile.personal_details or {}
+    return ProfileInDB(
+        id=db_profile.id,
+        user_id=db_profile.user_id,
+        fullName=pd.get("fullName", user.full_name if user else ""),
+        email=pd.get("email", user.email if user else ""),
+        phone=db_profile.phone,
+        address=pd.get("address"),
+        headline=pd.get("headline"),
+        summary=pd.get("summary"),
+        experience=[{"title": h["title"], "company": h["company"], "startDate": h.get("startDate"), "endDate": h.get("endDate"), "description": h.get("description")} for h in db_profile.employment_history],
+        education=[{"school": e["school"], "degree": e["degree"], "field": e.get("field"), "startDate": e.get("startDate"), "endDate": e.get("endDate")} for e in db_profile.education],
+        skills=db_profile.skills,
+        projects=[{"title": p["title"], "description": p["description"], "url": p.get("url"), "technologies": p.get("technologies", [])} for p in db_profile.projects],
+        profilePicture=pd.get("profilePicture"),
+        created_at=db_profile.created_at,
+        updated_at=db_profile.updated_at,
+        profile_completion=db_profile.profile_completion_pct,
+        profile_views=db_profile.profile_views or 0
+    )
 
 @router.post("/", response_model=ProfileInDB)
-async def create_profile(profile: ProfileCreate, token: str = Depends(oauth2_scheme)):
+async def create_profile(
+    profile: ProfileCreate, 
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
     try:
-        # Verify user exists
-        user = await get_current_user(token)
+        if current_user["id"] != profile.user_id:
+            raise HTTPException(status_code=403, detail="Not authorized")
         
-        # Get profiles collection
-        profiles_collection = get_profiles_collection()
+        stmt = select(JobSeekerProfileModel).where(JobSeekerProfileModel.user_id == profile.user_id)
+        if (await db.execute(stmt)).scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Profile already exists")
         
-        # Check if profile already exists for this user
-        existing_profile = await profiles_collection.find_one({"user_id": profile.user_id})
-        if existing_profile:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Profile already exists for this user"
-            )
-        
-        # Verify that the authenticated user is creating a profile for themselves
-        if user["id"] != profile.user_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Not authorized to create profile for another user"
-            )
-        
-        # Calculate profile completion
         profile_dict = profile.model_dump()
-        profile_completion = calculate_profile_completion(profile_dict)
-        profile_dict["profile_completion"] = profile_completion
+        completion = calculate_profile_completion(profile_dict)
         
-        profile_dict["user_id"] = profile.user_id
-        profile_dict["created_at"] = datetime.datetime.now(datetime.timezone.utc)
-        profile_dict["updated_at"] = datetime.datetime.now(datetime.timezone.utc)
-        
-        result = await profiles_collection.insert_one(profile_dict)
-        profile_dict["id"] = str(result.inserted_id)
-        
-        # Remove the _id from the dict since we added it as "id"
-        if "_id" in profile_dict:
-            del profile_dict["_id"]
-        
-        return ProfileInDB(**profile_dict)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error creating profile: {str(e)}"
+        db_profile = JobSeekerProfileModel(
+            id=str(uuid.uuid4()),
+            user_id=profile.user_id,
+            phone=profile.phone,
+            skills=profile.skills,
+            education=[e.model_dump() for e in profile.education] if profile.education else [],
+            employment_history=[h.model_dump() for h in profile.experience] if profile.experience else [],
+            projects=[p.model_dump() for p in profile.projects] if profile.projects else [],
+            personal_details={
+                "fullName": profile.fullName,
+                "email": profile.email,
+                "address": profile.address,
+                "headline": profile.headline,
+                "summary": profile.summary,
+                "profilePicture": profile.profilePicture
+            },
+            profile_completion_pct=completion,
+            created_at=datetime.datetime.utcnow(),
+            updated_at=datetime.datetime.utcnow(),
+            profile_views=0
         )
-
-@router.put("/{profile_id}", response_model=ProfileInDB)
-async def update_profile(profile_id: str, profile: ProfileUpdate, token: str = Depends(oauth2_scheme)):
-    try:
-        # Verify user exists
-        user = await get_current_user(token)
+        db.add(db_profile)
         
-        # Get profiles collection
-        profiles_collection = get_profiles_collection()
-        
-        # Find existing profile
-        existing_profile = await profiles_collection.find_one({"_id": ObjectId(profile_id)})
-        if not existing_profile:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Profile not found"
-            )
-        
-        # Check if user owns this profile
-        if existing_profile["user_id"] != user["id"]:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Not authorized to update this profile"
-            )
-        
-        # Calculate profile completion
-        profile_dict = profile.model_dump(exclude_unset=True)
-        profile_completion = calculate_profile_completion(profile_dict)
-        profile_dict["profile_completion"] = profile_completion
-        profile_dict["updated_at"] = datetime.datetime.now(datetime.timezone.utc)
-        
-        await profiles_collection.update_one(
-            {"_id": ObjectId(profile_id)},
-            {"$set": profile_dict}
-        )
-        
-        # Return updated profile
-        updated_profile = await profiles_collection.find_one({"_id": ObjectId(profile_id)})
-        if not updated_profile:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Profile not found after update"
-            )
-        updated_profile["id"] = str(updated_profile["_id"])
-        
-        # Remove the _id from the dict since we added it as "id"
-        if "_id" in updated_profile:
-            del updated_profile["_id"]
-        
-        return ProfileInDB(**updated_profile)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error updating profile: {str(e)}"
-        )
-
-@router.get("/user/{user_id}", response_model=ProfileInDB)
-async def get_user_profile(user_id: str, token: str = Depends(oauth2_scheme)):
-    try:
-        # Verify user exists
-        user = await get_current_user(token)
-        
-        # Get profiles collection
-        profiles_collection = get_profiles_collection()
-        
-        # For security, only allow users to access their own profile
-        # Check if the user_id in the URL matches the authenticated user
-        authenticated_user_id = user["id"]
-        
-        # Compare user IDs - they should be equal as both are converted to string representations of ObjectId
-        if authenticated_user_id != user_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Not authorized to access this profile. Expected {authenticated_user_id}, got {user_id}"
-            )
-        
-        # Find profile
-        profile = await profiles_collection.find_one({"user_id": user_id})
-        if not profile:
-            # Return an empty profile if none exists
-            empty_profile = {
-                "id": None,
-                "user_id": user_id,
-                "fullName": user.get("full_name", ""),
-                "email": user.get("email", ""),
-                "phone": "",
-                "address": "",
-                "headline": "",
-                "summary": "",
-                "profilePicture": user.get("profilePicture", ""),
-                "experience": [],
-                "education": [],
-                "skills": [],
-                "projects": [],
-                "profile_completion": 0,
-                "profile_views": 0,
-                "created_at": datetime.datetime.now(datetime.timezone.utc),
-                "updated_at": datetime.datetime.now(datetime.timezone.utc)
-            }
-            return ProfileInDB(**empty_profile)
-        
-        profile["id"] = str(profile["_id"])
-        
-        # Remove the _id from the dict since we added it as "id"
-        if "_id" in profile:
-            del profile["_id"]
-        
-        return ProfileInDB(**profile)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error fetching profile: {str(e)}"
-        )
-
-# New endpoint to update profile by user_id (useful for frontend)
-@router.put("/user/{user_id}", response_model=ProfileInDB)
-async def update_user_profile(user_id: str, profile: ProfileUpdate, token: str = Depends(oauth2_scheme)):
-    try:
-        # Verify user exists
-        user = await get_current_user(token)
-        
-        # Check if the requesting user is the same as the profile user
-        authenticated_user_id = user["id"]
-        if authenticated_user_id != user_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Not authorized to update this profile. Expected {authenticated_user_id}, got {user_id}"
-            )
-        
-        # Get profiles collection
-        profiles_collection = get_profiles_collection()
-        
-        # Find existing profile
-        existing_profile = await profiles_collection.find_one({"user_id": user_id})
-        if not existing_profile:
-            # If profile doesn't exist, create one
-            profile_dict = profile.model_dump(exclude_unset=True)
-            profile_completion = calculate_profile_completion(profile_dict)
-            profile_dict["profile_completion"] = profile_completion
-            profile_dict["user_id"] = user_id
-            profile_dict["created_at"] = datetime.datetime.now(datetime.timezone.utc)
-            profile_dict["updated_at"] = datetime.datetime.now(datetime.timezone.utc)
+        # Sync user full name
+        user_stmt = select(UserModel).where(UserModel.id == current_user["id"])
+        user = (await db.execute(user_stmt)).scalar_one()
+        if user.full_name != profile.fullName:
+            user.full_name = profile.fullName
             
-            result = await profiles_collection.insert_one(profile_dict)
-            profile_dict["id"] = str(result.inserted_id)
-            
-            if "_id" in profile_dict:
-                del profile_dict["_id"]
-            
-            return ProfileInDB(**profile_dict)
-        
-        # If profile exists, update it
-        profile_dict = profile.model_dump(exclude_unset=True)
-        # Merge with existing profile data to get full data for calculation
-        merged_profile = {**existing_profile, **profile_dict}
-        profile_completion = calculate_profile_completion(merged_profile)
-        profile_dict["profile_completion"] = profile_completion
-        profile_dict["updated_at"] = datetime.datetime.now(datetime.timezone.utc)
-        
-        await profiles_collection.update_one(
-            {"user_id": user_id},
-            {"$set": profile_dict}
-        )
-        
-        # Return updated profile
-        updated_profile = await profiles_collection.find_one({"user_id": user_id})
-        if not updated_profile:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Profile not found after update"
-            )
-        updated_profile["id"] = str(updated_profile["_id"])
-        
-        # Remove the _id from the dict since we added it as "id"
-        if "_id" in updated_profile:
-            del updated_profile["_id"]
-        
-        return ProfileInDB(**updated_profile)
-    except HTTPException:
-        raise
+        await db.commit()
+        await db.refresh(db_profile)
+        return map_model_to_schema(db_profile, user)
+    except HTTPException: raise
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error updating profile: {str(e)}"
-        )
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
 
-# Endpoint to upload profile picture
+@router.get("/me", response_model=ProfileInDB)
+async def get_my_profile(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    stmt = select(JobSeekerProfileModel).where(JobSeekerProfileModel.user_id == current_user["id"])
+    db_profile = (await db.execute(stmt)).scalar_one_or_none()
+    
+    if not db_profile:
+        return ProfileInDB(
+            id="", user_id=current_user["id"], fullName=current_user.get("full_name", ""),
+            email=current_user.get("email", ""), phone="", experience=[], education=[],
+            skills=[], projects=[], created_at=datetime.datetime.utcnow(), profile_completion=0
+        )
+    
+    return map_model_to_schema(db_profile)
+
+@router.get("/{user_id}", response_model=ProfileInDB)
+async def get_profile(user_id: str, db: AsyncSession = Depends(get_db)):
+    stmt = select(JobSeekerProfileModel).where(JobSeekerProfileModel.user_id == user_id)
+    db_profile = (await db.execute(stmt)).scalar_one_or_none()
+    
+    if not db_profile:
+        user_stmt = select(UserModel).where(UserModel.id == user_id)
+        user = (await db.execute(user_stmt)).scalar_one_or_none()
+        if not user: raise HTTPException(status_code=404, detail="Not found")
+        return ProfileInDB(
+            id="", user_id=user_id, fullName=user.full_name, email=user.email,
+            phone="", experience=[], education=[], skills=[], projects=[],
+            created_at=datetime.datetime.utcnow(), profile_completion=0
+        )
+    
+    db_profile.profile_views = (db_profile.profile_views or 0) + 1
+    await db.commit()
+    await db.refresh(db_profile)
+    return map_model_to_schema(db_profile)
+
+@router.put("/me", response_model=ProfileInDB)
+async def update_my_profile(
+    update_data: ProfileUpdate, 
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        stmt = select(JobSeekerProfileModel).where(JobSeekerProfileModel.user_id == current_user["id"])
+        db_profile = (await db.execute(stmt)).scalar_one_or_none()
+        if not db_profile: raise HTTPException(status_code=404, detail="Not found")
+        
+        data = update_data.model_dump(exclude_unset=True)
+        pd = db_profile.personal_details or {}
+        
+        for k in ["fullName", "email", "address", "headline", "summary", "profilePicture"]:
+            if k in data: pd[k] = data[k]
+        db_profile.personal_details = pd
+        
+        if "phone" in data: db_profile.phone = data["phone"]
+        if "skills" in data: db_profile.skills = data["skills"]
+        if "experience" in data:
+            db_profile.employment_history = [e.model_dump() if hasattr(e, 'model_dump') else e for e in (update_data.experience or [])]
+        if "education" in data:
+            db_profile.education = [e.model_dump() if hasattr(e, 'model_dump') else e for e in (update_data.education or [])]
+        if "projects" in data:
+            db_profile.projects = [p.model_dump() if hasattr(p, 'model_dump') else p for p in (update_data.projects or [])]
+            
+        # Re-calc completion
+        completion_data = {
+            "personal_details": pd, "phone": db_profile.phone, "skills": db_profile.skills,
+            "employment_history": db_profile.employment_history, "education": db_profile.education,
+            "projects": db_profile.projects
+        }
+        db_profile.profile_completion_pct = calculate_profile_completion(completion_data)
+        db_profile.updated_at = datetime.datetime.utcnow()
+        
+        if "fullName" in data:
+            user_stmt = select(UserModel).where(UserModel.id == current_user["id"])
+            user = (await db.execute(user_stmt)).scalar_one()
+            user.full_name = data["fullName"]
+            
+        await db.commit()
+        await db.refresh(db_profile)
+        return map_model_to_schema(db_profile)
+    except HTTPException: raise
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
 @router.post("/upload-picture")
-async def upload_profile_picture(file: UploadFile = File(...), token: str = Depends(oauth2_scheme)):
+async def upload_picture(
+    file: UploadFile = File(...), 
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
     try:
-        # Verify user exists
-        user = await get_current_user(token)
-        user_id = user["id"]
-        
-        # Validate file type
-        allowed_types = ["image/jpeg", "image/jpg", "image/png", "image/gif"]
-        if file.content_type not in allowed_types:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid file type. Only JPEG, PNG, and GIF images are allowed."
-            )
-        
-        # Create uploads directory if it doesn't exist
-        upload_dir = Path("uploads/profile_pictures")
+        upload_dir = Path("uploads/profiles")
         upload_dir.mkdir(parents=True, exist_ok=True)
+        ext = os.path.splitext(file.filename)[1]
+        fname = f"{current_user['id']}_{uuid.uuid4()}{ext}"
+        fpath = upload_dir / fname
         
-        # Generate unique filename
-        file_extension = file.filename.split(".")[-1]
-        unique_filename = f"{user_id}.{file_extension}"
-        file_path = upload_dir / unique_filename
+        with open(fpath, "wb") as buffer:
+            buffer.write(await file.read())
         
-        # Save file
-        contents = await file.read()
-        with open(file_path, "wb") as f:
-            f.write(contents)
+        url = f"/uploads/profiles/{fname}"
+        stmt = select(JobSeekerProfileModel).where(JobSeekerProfileModel.user_id == current_user["id"])
+        db_profile = (await db.execute(stmt)).scalar_one_or_none()
         
-        # Get profiles collection
-        profiles_collection = get_profiles_collection()
-        
-        # Update user's profile with the picture URL
-        profile_picture_url = f"/uploads/profile_pictures/{unique_filename}"
-        await profiles_collection.update_one(
-            {"user_id": user_id},
-            {"$set": {"profilePicture": profile_picture_url, "updated_at": datetime.datetime.now(datetime.timezone.utc)}}
-        )
-        
-        # Also update the user's profile completion
-        existing_profile = await profiles_collection.find_one({"user_id": user_id})
-        if existing_profile:
-            profile_completion = calculate_profile_completion(existing_profile)
-            await profiles_collection.update_one(
-                {"user_id": user_id},
-                {"$set": {"profile_completion": profile_completion}}
-            )
-        
-        return {"filename": unique_filename, "url": profile_picture_url}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error uploading profile picture: {str(e)}"
-        )
-
-# Endpoint to increment profile view count
-@router.post("/user/{user_id}/view")
-async def increment_profile_view(user_id: str, token: str = Depends(oauth2_scheme)):
-    try:
-        # Verify user exists (recruiter viewing the profile)
-        viewer = await get_current_user(token)
-        
-        # Get profiles collection
-        profiles_collection = get_profiles_collection()
-        
-        # Find existing profile
-        existing_profile = await profiles_collection.find_one({"user_id": user_id})
-        
-        if not existing_profile:
-            # If profile doesn't exist yet, we can't increment view on it, but we shouldn't error out generally
-            # just return success with no action or create empty profile?
-            # Better to return 404 if profile strictly required, but for "views" it might be soft.
-            # Let's return 404 to be specific.
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Profile not found"
-            )
+        if db_profile:
+            pd = db_profile.personal_details or {}
+            pd["profilePicture"] = url
+            db_profile.personal_details = pd
+            db_profile.updated_at = datetime.datetime.utcnow()
+            await db.commit()
             
-        # Increment view count
-        # Ensure profile_views exists, if not set to 1
-        new_views = existing_profile.get("profile_views", 0) + 1
-        
-        await profiles_collection.update_one(
-            {"user_id": user_id},
-            {"$set": {"profile_views": new_views}}
-        )
-        
-        return {"message": "View count incremented", "views": new_views}
-        
-    except HTTPException:
-        raise
+        return {"profilePicture": url}
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error incrementing view count: {str(e)}"
-        )
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/user/{user_id}/view")
+async def increment_view(user_id: str, db: AsyncSession = Depends(get_db)):
+    stmt = select(JobSeekerProfileModel).where(JobSeekerProfileModel.user_id == user_id)
+    db_profile = (await db.execute(stmt)).scalar_one_or_none()
+    if not db_profile: raise HTTPException(status_code=404, detail="Not found")
+    db_profile.profile_views = (db_profile.profile_views or 0) + 1
+    await db.commit()
+    return {"views": db_profile.profile_views}

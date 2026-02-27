@@ -22,6 +22,7 @@ class JobAlertUpdate(BaseModel):
 
 class JobAlert(JobAlertBase):
     id: str
+    user_name: Optional[str] = None
     created_at: datetime = datetime.now()
     updated_at: datetime = datetime.now()
     last_triggered: Optional[datetime] = None

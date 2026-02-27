@@ -28,6 +28,8 @@ class JobBase(BaseModel):
     company_logo_url: Optional[str]
     company_rating: Optional[float]
     reviews_count: Optional[int]
+    employer_phone: Optional[str] = None
+    employer_email: Optional[str] = None
 
 class JobCreate(JobBase):
     pass

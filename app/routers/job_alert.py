@@ -1,233 +1,238 @@
-from fastapi import APIRouter, HTTPException, status, Query
-from app.models.job_alert import JobAlertCreate, JobAlertUpdate, JobAlert
-from app.database.database import job_alerts_collection, users_collection, jobs_collection
-from bson import ObjectId
-from datetime import datetime
+from fastapi import APIRouter, HTTPException, status, Query, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, and_, or_, delete, desc
+from app.database.database import get_db
+from app.database.models import JobAlert as JobAlertModel, User as UserModel, Job as JobModel, Company as CompanyModel
+from app.models.job_alert import JobAlertCreate, JobAlertUpdate, JobAlert as JobAlertSchema
+from datetime import datetime, timedelta
 from typing import List
-from pymongo import ReturnDocument
+import uuid
 
 router = APIRouter(prefix="/api/job-alerts", tags=["Job Alerts"])
 
-@router.post("/", response_model=JobAlert)
-async def create_job_alert(alert: JobAlertCreate):
+@router.post("/", response_model=JobAlertSchema)
+async def create_job_alert(
+    alert: JobAlertCreate,
+    db: AsyncSession = Depends(get_db)
+):
     try:
         # Check if user exists
-        user = await users_collection.find_one({"_id": ObjectId(alert.user_id)})
+        user_stmt = select(UserModel).where(UserModel.id == alert.user_id)
+        user = (await db.execute(user_stmt)).scalar_one_or_none()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         
         # Check if similar alert already exists for this user
-        existing_alert = await job_alerts_collection.find_one({
-            "user_id": alert.user_id,
-            "search_params": alert.search_params
-        })
+        existing_stmt = select(JobAlertModel).where(
+            and_(JobAlertModel.user_id == alert.user_id, JobAlertModel.title == alert.title)
+        )
+        existing_alert = (await db.execute(existing_stmt)).scalar_one_or_none()
         if existing_alert:
-            raise HTTPException(status_code=400, detail="Job alert with these parameters already exists")
+            raise HTTPException(status_code=400, detail="Job alert with this title already exists")
         
-        # Convert to dict and add required fields
-        alert_dict = alert.dict()
-        alert_dict["created_at"] = datetime.now()
-        alert_dict["updated_at"] = datetime.now()
-        alert_dict["last_triggered"] = None
-        alert_dict["matched_jobs_count"] = 0
+        # Create alert
+        alert_db = JobAlertModel(
+            id=str(uuid.uuid4()),
+            user_id=alert.user_id,
+            title=alert.title,
+            search_params=alert.search_params,
+            frequency=alert.frequency,
+            is_active=alert.is_active,
+            email_notifications=alert.email_notifications,
+            push_notifications=alert.push_notifications,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow()
+        )
+        db.add(alert_db)
+        await db.commit()
+        await db.refresh(alert_db)
         
-        result = await job_alerts_collection.insert_one(alert_dict)
-        alert_dict["id"] = str(result.inserted_id)
-        del alert_dict["_id"]
+        # Add user name for response
+        alert_db.user_name = user.full_name
         
-        return JobAlert(**alert_dict)
+        return alert_db
+    except HTTPException:
+        raise
     except Exception as e:
+        await db.rollback()
         raise HTTPException(status_code=500, detail=f"Error creating job alert: {str(e)}")
 
-@router.get("/{alert_id}", response_model=JobAlert)
-async def get_job_alert(alert_id: str):
+@router.get("/{alert_id}", response_model=JobAlertSchema)
+async def get_job_alert(
+    alert_id: str,
+    db: AsyncSession = Depends(get_db)
+):
     try:
-        alert = await job_alerts_collection.find_one({"_id": ObjectId(alert_id)})
-        if not alert:
+        stmt = select(JobAlertModel, UserModel.full_name)\
+            .join(UserModel, UserModel.id == JobAlertModel.user_id)\
+            .where(JobAlertModel.id == alert_id)
+        
+        result = await db.execute(stmt)
+        res = result.first()
+        if not res:
             raise HTTPException(status_code=404, detail="Job alert not found")
         
-        alert["id"] = str(alert["_id"])
-        del alert["_id"]
-        
-        # Get user details
-        user = await users_collection.find_one({"_id": ObjectId(alert["user_id"])})
-        if user:
-            alert["user_name"] = user.get("full_name", "Unknown User")
-        
-        return JobAlert(**alert)
+        alert, user_name = res
+        alert.user_name = user_name
+        return alert
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error retrieving job alert: {str(e)}")
 
-@router.put("/{alert_id}", response_model=JobAlert)
-async def update_job_alert(alert_id: str, alert_update: JobAlertUpdate):
+@router.put("/{alert_id}", response_model=JobAlertSchema)
+async def update_job_alert(
+    alert_id: str, 
+    alert_update: JobAlertUpdate,
+    db: AsyncSession = Depends(get_db)
+):
     try:
-        existing_alert = await job_alerts_collection.find_one({"_id": ObjectId(alert_id)})
-        if not existing_alert:
-            raise HTTPException(status_code=404, detail="Job alert not found")
-        
-        # Prepare update data
-        update_data = alert_update.dict(exclude_unset=True)
-        update_data["updated_at"] = datetime.now()
-        
-        # Update the document and return the updated document
-        updated_alert = await job_alerts_collection.find_one_and_update(
-            {"_id": ObjectId(alert_id)},
-            {"$set": update_data},
-            return_document=ReturnDocument.AFTER
-        )
-        
-        if updated_alert:
-            updated_alert["id"] = str(updated_alert["_id"])
-            del updated_alert["_id"]
-            
-            # Get user details
-            user = await users_collection.find_one({"_id": ObjectId(updated_alert["user_id"])})
-            if user:
-                updated_alert["user_name"] = user.get("full_name", "Unknown User")
-            
-            return JobAlert(**updated_alert)
-        else:
-            raise HTTPException(status_code=404, detail="Job alert not found after update")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error updating job alert: {str(e)}")
-
-@router.delete("/{alert_id}")
-async def delete_job_alert(alert_id: str):
-    try:
-        alert = await job_alerts_collection.find_one({"_id": ObjectId(alert_id)})
+        stmt = select(JobAlertModel).where(JobAlertModel.id == alert_id)
+        alert = (await db.execute(stmt)).scalar_one_or_none()
         if not alert:
             raise HTTPException(status_code=404, detail="Job alert not found")
         
-        await job_alerts_collection.delete_one({"_id": ObjectId(alert_id)})
-        return {"message": "Job alert deleted successfully"}
+        update_data = alert_update.model_dump(exclude_unset=True)
+        for key, value in update_data.items():
+            setattr(alert, key, value)
+        
+        alert.updated_at = datetime.utcnow()
+        await db.commit()
+        await db.refresh(alert)
+        
+        # Get user name for response
+        user_stmt = select(UserModel.full_name).where(UserModel.id == alert.user_id)
+        user_name = (await db.execute(user_stmt)).scalar()
+        alert.user_name = user_name
+        
+        return alert
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error deleting job alert: {str(e)}")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error updating job alert: {str(e)}")
 
-@router.get("/", response_model=List[JobAlert])
-async def list_job_alerts(
-    user_id: str = Query(None, description="Filter by user ID"),
-    is_active: bool = Query(None, description="Filter by active status"),
-    skip: int = 0,
-    limit: int = 20
+@router.delete("/{alert_id}")
+async def delete_job_alert(
+    alert_id: str,
+    db: AsyncSession = Depends(get_db)
 ):
     try:
-        query = {}
-        if user_id:
-            query["user_id"] = user_id
-        if is_active is not None:
-            query["is_active"] = is_active
+        stmt = select(JobAlertModel).where(JobAlertModel.id == alert_id)
+        alert = (await db.execute(stmt)).scalar_one_or_none()
+        if not alert:
+            raise HTTPException(status_code=404, detail="Job alert not found")
         
+        await db.delete(alert)
+        await db.commit()
+        return {"message": "Job alert deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error deleting job alert: {str(e)}")
+
+@router.get("/", response_model=List[JobAlertSchema])
+async def list_job_alerts(
+    user_id: str = Query(None),
+    is_active: bool = Query(None),
+    skip: int = 0,
+    limit: int = 20,
+    db: AsyncSession = Depends(get_db)
+):
+    try:
+        stmt = select(JobAlertModel, UserModel.full_name)\
+            .join(UserModel, UserModel.id == JobAlertModel.user_id)
+            
+        if user_id:
+            stmt = stmt.where(JobAlertModel.user_id == user_id)
+        if is_active is not None:
+            stmt = stmt.where(JobAlertModel.is_active == is_active)
+        
+        stmt = stmt.order_by(desc(JobAlertModel.created_at)).offset(skip).limit(limit)
+        
+        result = await db.execute(stmt)
         alerts = []
-        cursor = job_alerts_collection.find(query).sort("created_at", -1).skip(skip).limit(limit)
-        async for alert in cursor:
-            alert_obj = {
-                "user_id": alert.get("user_id", ""),
-                "search_params": alert.get("search_params", {}),
-                "title": alert.get("title", ""),
-                "is_active": alert.get("is_active", True),
-                "frequency": alert.get("frequency", "daily"),
-                "email_notifications": alert.get("email_notifications", True),
-                "push_notifications": alert.get("push_notifications", True),
-                "id": str(alert["_id"]),
-                "created_at": alert.get("created_at", datetime.now()),
-                "updated_at": alert.get("updated_at", datetime.now()),
-                "last_triggered": alert.get("last_triggered"),
-                "matched_jobs_count": alert.get("matched_jobs_count", 0)
-            }
-            del alert["_id"]
-            
-            # Get user details
-            user = await users_collection.find_one({"_id": ObjectId(alert_obj["user_id"])})
-            if user:
-                alert_obj["user_name"] = user.get("full_name", "Unknown User")
-            
-            alerts.append(JobAlert(**alert_obj))
+        for alert, user_name in result.all():
+            alert.user_name = user_name
+            alerts.append(alert)
         
         return alerts
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error listing job alerts: {str(e)}")
 
 @router.get("/user/{user_id}/recent-jobs")
-async def get_recent_jobs_for_alerts(user_id: str):
+async def get_recent_jobs_for_alerts(
+    user_id: str,
+    db: AsyncSession = Depends(get_db)
+):
     """Get recent jobs that match user's saved alerts"""
     try:
         # Get user's active job alerts
-        alerts = []
-        cursor = job_alerts_collection.find({"user_id": user_id, "is_active": True})
-        async for alert in cursor:
-            alert["id"] = str(alert["_id"])
-            del alert["_id"]
-            alerts.append(alert)
+        stmt = select(JobAlertModel).where(and_(JobAlertModel.user_id == user_id, JobAlertModel.is_active == True))
+        result = await db.execute(stmt)
+        alerts = result.scalars().all()
         
-        # For each alert, find matching jobs that were posted after the alert was last triggered
         matching_jobs = []
         for alert in alerts:
-            search_params = alert.get("search_params", {})
+            search_params = alert.search_params or {}
             
             # Build query from search parameters
-            query = {"is_active": True}
+            job_stmt = select(JobModel, CompanyModel.name, UserModel.full_name)\
+                .outerjoin(CompanyModel, CompanyModel.id == JobModel.company_id)\
+                .outerjoin(UserModel, UserModel.id == JobModel.posted_by)\
+                .where(JobModel.is_active == True)
             
-            # Add search term if present
+            # Add search term filters
             if search_params.get("search"):
-                query["$or"] = [
-                    {"title": {"$regex": search_params["search"], "$options": "i"}},
-                    {"description": {"$regex": search_params["search"], "$options": "i"}},
-                    {"skills": {"$in": [search_params["search"]]}}
-                ]
+                search = search_params["search"]
+                job_stmt = job_stmt.where(or_(
+                    JobModel.title.ilike(f"%{search}%"),
+                    JobModel.description.ilike(f"%{search}%"),
+                    JobModel.skills.contains([search])
+                ))
             
-            # Add location filter if present
+            # Add other filters
             if search_params.get("location"):
-                query["location"] = {"$regex": search_params["location"], "$options": "i"}
+                job_stmt = job_stmt.where(JobModel.location.ilike(f"%{search_params['location']}%"))
             
-            # Add experience filter if present
             if search_params.get("experience_min"):
-                query["experience_required"] = {"$regex": f"{search_params['experience_min']}.*", "$options": "i"}
+                # Simplified experience filter
+                job_stmt = job_stmt.where(JobModel.experience_required.ilike(f"{search_params['experience_min']}%"))
             
-            # Add salary filter if present
             if search_params.get("salary_min"):
-                query["salary_min"] = {"$gte": search_params["salary_min"]}
+                job_stmt = job_stmt.where(JobModel.salary_min >= search_params["salary_min"])
             
-            # Add job type filter if present
             if search_params.get("job_type"):
-                query["job_type"] = search_params["job_type"]
+                job_stmt = job_stmt.where(JobModel.job_type == search_params["job_type"])
             
-            # Add work mode filter if present
             if search_params.get("work_mode"):
-                query["work_mode"] = search_params["work_mode"]
+                job_stmt = job_stmt.where(JobModel.work_mode == search_params["work_mode"])
             
-            # Add skills filter if present
             if search_params.get("skills"):
-                query["skills"] = {"$all": search_params["skills"]}
+                job_stmt = job_stmt.where(JobModel.skills.contains(search_params["skills"]))
             
-            # Only get jobs posted after last trigger (or last 7 days if never triggered)
-            from datetime import timedelta
-            if alert.get("last_triggered"):
-                query["posted_at"] = {"$gte": alert["last_triggered"]}
-            else:
-                query["posted_at"] = {"$gte": datetime.now() - timedelta(days=7)}
+            # Timestamp filter (using posted_at as renamed in Job model)
+            since = alert.last_triggered or (datetime.utcnow() - timedelta(days=7))
+            job_stmt = job_stmt.where(JobModel.posted_at >= since)
             
-            # Find matching jobs
-            cursor = jobs_collection.find(query).sort("posted_at", -1)
-            async for job in cursor:
-                job["id"] = str(job["_id"])
-                del job["_id"]
-                
-                # Get employer details
-                if "posted_by" in job:
-                    employer = await users_collection.find_one({"_id": ObjectId(job["posted_by"])})
-                    if employer:
-                        job["employer_name"] = employer.get("full_name", "Unknown Employer")
-                
-                # Get company details
-                if "company_id" in job and job["company_id"]:
-                    company = await companies_collection.find_one({"_id": ObjectId(job["company_id"])})
-                    if company:
-                        job["company"] = company.get("name", job.get("company", ""))
-                
-                job["matched_alert_id"] = alert["id"]
-                job["matched_alert_title"] = alert["title"]
-                matching_jobs.append(job)
+            job_stmt = job_stmt.order_by(desc(JobModel.posted_at))
+            
+            jobs_res = await db.execute(job_stmt)
+            for job, company_name, employer_name in jobs_res.all():
+                job_dict = {column.name: getattr(job, column.name) for column in job.__table__.columns}
+                job_dict["company"] = company_name or job.company
+                job_dict["employer_name"] = employer_name
+                job_dict["matched_alert_id"] = alert.id
+                job_dict["matched_alert_title"] = alert.title
+                matching_jobs.append(job_dict)
         
-        return matching_jobs
+        # Deduplicate jobs by id if they matched multiple alerts
+        unique_jobs = {}
+        for job in matching_jobs:
+            if job["id"] not in unique_jobs:
+                unique_jobs[job["id"]] = job
+        
+        return list(unique_jobs.values())
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error finding matching jobs: {str(e)}")
