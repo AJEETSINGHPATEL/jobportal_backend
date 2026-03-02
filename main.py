@@ -72,10 +72,11 @@ app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
 # Configure CORS
 origins = [
     "http://localhost:3000",
+    "https://jobflux.netlify.app",
     "https://jobflux.netlify.app/",
     "http://127.0.0.1:3000",
     "http://127.0.0.1:3001",
-    os.getenv("FRONTEND_URL", "https://jobflux.netlify.app/")
+    os.getenv("FRONTEND_URL", "https://jobflux.netlify.app")
 ]
 
 app.add_middleware(
