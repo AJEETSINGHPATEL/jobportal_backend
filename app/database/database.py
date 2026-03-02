@@ -14,13 +14,14 @@ def get_async_database_url(url: str) -> str:
     if not url:
         return ""
     
+    # Clean up malformed strings (like DATABASE_URL="url" or just "url")
+    url = url.strip().strip('"').strip("'")
+    if url.startswith("DATABASE_URL="):
+        url = url.replace("DATABASE_URL=", "", 1).strip().strip('"').strip("'")
+
     # Force asyncpg driver
     if url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    elif not url.startswith("postgresql+asyncpg://"):
-        # If it's just a raw connection string without prefix, prepending might be risky, 
-        # but the user provided a postgresql:// one.
-        pass
 
     try:
         # Parse the URL to handle special characters in password
