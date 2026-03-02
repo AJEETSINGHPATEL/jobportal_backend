@@ -30,7 +30,16 @@ from app.database.database import get_db, engine
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("AI Job Portal API starting up (PostgreSQL mode)...")
+    # Masked DATABASE_URL for logging
+    from app.database.database import DATABASE_URL
+    masked_url = DATABASE_URL
+    if "@" in DATABASE_URL:
+        # Extract everything after @
+        parts = DATABASE_URL.split("@")
+        masked_url = "****@" + parts[1]
+    
+    print(f"AI Job Portal API starting up (PostgreSQL mode)...")
+    print(f"Connecting to: {masked_url}")
     # Tables are created via create_tables.py usually, 
     # but we could call create_tables() here if desired.
     yield
